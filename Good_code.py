@@ -1,7 +1,7 @@
 from control import lqr,dlqr
 import numpy as np
 import matplotlib.pyplot as plt
-from Utils import build_tan_pwl, make_deviation_model
+from Utils import build_tan_pwl, make_deviation_model, bin_index
 
 class LQRController:
     def __init__(self,Q,R,A_bank = None,B_bank = None):
@@ -144,8 +144,109 @@ class State_space:
                 self.cbank[ip, it] = c
 
 
+class Virtual_input_to_motor_inputs:
+    def __init__(self,virtual_u,number_of_inputs = 4, arm_len= 0.3, yaw_c =0.02, f_min=-25, f_max=25,is_x_config=True, desat_yaw=True, iters=8):
+        self.arm_len = arm_len
+        self.yaw_c = yaw_c
+        self.f_min = f_min
+        self.f_max = f_max
+        self.is_x_config = is_x_config
+        self.desat_yaw = desat_yaw
+        self.iters = iters
+        self.virtual_u = virtual_u 
+        self.u = np.zeros(number_of_inputs)
+        self.f = np.zeros(number_of_inputs)
+        self.M = None
+        self.Minv = None
+        
+    def mixing_matrix_gen(self):
+        # Effective arm for torque depending on geometry
+        l_eff = self.arm_len / np.sqrt(2.0) if self.is_x_config else self.arm_len
+        c = self.yaw_c
+
+        # Mixer: u = M f
+        # Row 1: T
+        # Row 2: tau_x (roll): left(+), right(-) => [+ - + -]
+        # Row 3: tau_y (pitch): front(-), rear(+) => [- - + +]
+        # Row 4: tau_z (yaw): (1,4) CCW negative, (2,3) CW positive => [- + + -]
+        M = np.array([
+            [1.0,    1.0,    1.0,    1.0],
+            [l_eff, -l_eff,  l_eff, -l_eff],
+            [-l_eff,-l_eff,  l_eff,  l_eff],
+            [-c,     c,      c,     -c],
+        ], dtype=float)
+        self.M = M
+        
+
+        # Precompute inverse 
+        Minv = np.linalg.inv(M)
+        self.Minv = Minv
+        return Minv, M
+    def mix_to_motors(self, Minv,destroy=False,iters=4):
+        self.f = Minv @ self.virtual_u
+        if destroy:
+            for _ in range(max(1, iters)):
+                f = Minv @ self.virtual_u
+                if np.all(f >= self.f_min) and np.all(f <= self.f_max):
+                    break
+
+                dz = Minv[:, 3]  # sensitivity of motor thrusts to tau_z
+                over = np.maximum(f - self.f_max, 0.0)
+                under = np.maximum(self.f_min - f, 0.0)
+
+                # Choose worst violation to fix
+                k_over = int(np.argmax(over))
+                k_under = int(np.argmax(under))
+
+                if over[k_over] > under[k_under]:
+                    k = k_over
+                    if abs(dz[k]) > 1e-12:
+                        self.virtual_u[3] -= over[k] / dz[k]
+                else:
+                    k = k_under
+                    if abs(dz[k]) > 1e-12:
+                        self.virtual_u[3] += under[k] / dz[k]
+
+        f = np.clip(self.f, self.f_min, self.f_max)
+        self.u = self.M @ f
+        return self.u
 
 class Simulator:
-    def __init__(self):
-        pass
-    
+    def __init__(self,LQR_controller = None,State_space = None,virtual_input_to_motor_inputs = None):
+        self.LQR_controller = LQR_controller
+        self.State_space = State_space
+        self.virtual_input_to_motor_inputs = virtual_input_to_motor_inputs
+        self.bank_a = self.State_space.abank
+        self.bank_b = self.State_space.bbank
+        self.dev_bank = self.State_space.dev_bank
+        self.edges_phi = self.State_space.edges_phi
+        self.edges_th = self.State_space.edges_th
+        self.current_state = np.zeros(self.State_space.n_states)
+        self.current_deviation = None
+        
+    def step_state(self, u, dt):
+        # 1) pick bins from current state
+        ip = bin_index(self.current_state[6], self.edges_phi)   # phi
+        it = bin_index(self.current_state[7], self.edges_th)    # theta
+
+        # 2) get deviation model + trim
+        A = self.bank_a[ip, it]
+        B = self.bank_b[ip, it]
+        self.current_deviation, u0 = self.dev_bank[ip, it]
+
+        # 3) deviation coordinates
+        dx = self.current_state - self.current_deviation
+        du = u - u0
+
+        # 4) state derivative (deviation)
+        dx_dot = A @ dx + B @ du
+
+        # 5) integrate
+        dx_next = dx + dx_dot * dt
+
+        # 6) back to absolute state
+        x_next = dx_next + self.current_deviation
+        self.current_state = x_next
+
+        return x_next
+
