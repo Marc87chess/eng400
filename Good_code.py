@@ -381,7 +381,16 @@ class Simulator:
 
         return t, self.x_hist, self.y_hist, self.u_hist
 
-      
+class Exporter:
+    def __init__(self,Simulator):
+        self.Simulator = Simulator
+        self.LQR_controller = Simulator.LQR_controller
+        self.State_space = Simulator.State_space    
+        self.virtual_input_to_motor_inputs = Simulator.virtual_input_to_motor_inputs
+    def export(self):
+        #TODO Export K_bank, State_space, and Virtual_input_to_motor_inputs parameters to files for use in C++ implementation
+        pass  
+    
 
 if __name__ == "__main__":
     # Example usage
